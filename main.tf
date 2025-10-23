@@ -42,16 +42,11 @@ resource "aws_iam_role" "snowflake_access_role" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect = "Allow"
+        Effect = "Deny"
         Principal = {
           AWS = "*"
         }
         Action = "sts:AssumeRole"
-        Condition = {
-          StringEquals = {
-            "sts:ExternalId" = "0000"
-          }
-        }
       }
     ]
   })
@@ -119,12 +114,45 @@ resource "snowflake_schema" "tf_db_tf_schema" {
   with_managed_access = false
 }
 
+// https://registry.terraform.io/providers/snowflakedb/snowflake/latest/docs/resources/storage_integration
 resource "snowflake_storage_integration" "s3_integration" {
-  name                 = "${local.project}_S3_INTEGRATION"
-  storage_provider     = "S3"
-  enabled              = true
-  storage_aws_role_arn = aws_iam_role.snowflake_access_role.arn
+  depends_on              = [aws_iam_role.snowflake_access_role]
+  name                    = "${local.project}_S3_INTEGRATION"
+  storage_provider        = "S3"
+  enabled                 = true
+  storage_aws_external_id = "testing-external-id-12345"
+  storage_aws_role_arn    = aws_iam_role.snowflake_access_role.arn
   storage_allowed_locations = [
     "s3://${aws_s3_bucket.example.bucket}/"
   ]
+}
+
+# To avoid a Terraform 'Cycle Error', we need to update the AWS role with the correct trusted relationship,
+# using the new snowflake arns we received from the integration
+resource "null_resource" "update_iam_role" {
+  depends_on = [snowflake_storage_integration.s3_integration, aws_iam_role.snowflake_access_role]
+  triggers = {
+    always_run = timestamp()
+  }
+  provisioner "local-exec" {
+    command = <<EOT
+      aws iam update-assume-role-policy --role-name ${aws_iam_role.snowflake_access_role.name} --policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": "${snowflake_storage_integration.s3_integration.storage_aws_iam_user_arn}"
+            },
+            "Action": "sts:AssumeRole",
+            "Condition": {
+              "StringEquals": {
+                "sts:ExternalId": "${snowflake_storage_integration.s3_integration.storage_aws_external_id}"
+              }
+            }
+          }
+        ]
+      }'
+    EOT
+  }
 }
