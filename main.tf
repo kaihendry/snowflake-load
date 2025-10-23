@@ -11,7 +11,9 @@ terraform {
 }
 
 locals {
-  project = "snowflakeap"
+  project                          = "snowflakeap"
+  snowflake_iam_role               = "role"
+  precalculated_snowflake_role_arn = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${join("-", [local.project, local.snowflake_iam_role])}"
 }
 
 provider "aws" {
@@ -25,6 +27,7 @@ provider "aws" {
 }
 
 data "aws_region" "current" {}
+data "aws_caller_identity" "current" {}
 
 resource "aws_s3_bucket" "example" {
   bucket = format(
@@ -35,26 +38,34 @@ resource "aws_s3_bucket" "example" {
   )
 }
 
-// create a IAM role that can read the bucket
+// Create Snowflake IAM role based on the results of storage integration
 resource "aws_iam_role" "snowflake_access_role" {
-  name = "${local.project}-snowflake-access-role"
+  name = join("-", [local.project, local.snowflake_iam_role])
+
   assume_role_policy = jsonencode({
-    Version = "2012-10-17"
+    Version = "2012-10-17",
     Statement = [
       {
-        Effect = "Deny"
+        Action = "sts:AssumeRole",
+        Effect = "Allow",
         Principal = {
-          AWS = "*"
+          AWS = snowflake_storage_integration.s3_integration.storage_aws_iam_user_arn
         }
-        Action = "sts:AssumeRole"
+        Condition = {
+          StringEquals = {
+            "sts:ExternalId" = snowflake_storage_integration.s3_integration.storage_aws_external_id
+          }
+        }
       }
     ]
   })
+
+  depends_on = [snowflake_storage_integration.s3_integration]
 }
 
 // add s3 permissions to the role
 resource "aws_iam_role_policy" "snowflake_access_policy" {
-  name = "${local.project}-snowflake-access-policy"
+  name = "${local.project}-${local.snowflake_iam_role}-policy"
   role = aws_iam_role.snowflake_access_role.id
   policy = jsonencode({
     Version = "2012-10-17"
@@ -115,44 +126,13 @@ resource "snowflake_schema" "tf_db_tf_schema" {
 }
 
 // https://registry.terraform.io/providers/snowflakedb/snowflake/latest/docs/resources/storage_integration
+// Create storage integration first without IAM role ARN
 resource "snowflake_storage_integration" "s3_integration" {
-  depends_on              = [aws_iam_role.snowflake_access_role]
-  name                    = "${local.project}_S3_INTEGRATION"
-  storage_provider        = "S3"
-  enabled                 = true
-  storage_aws_external_id = "testing-external-id-12345"
-  storage_aws_role_arn    = aws_iam_role.snowflake_access_role.arn
+  name                 = "${local.project}_S3_INTEGRATION"
+  storage_aws_role_arn = local.precalculated_snowflake_role_arn
+  storage_provider     = "S3"
+  enabled              = true
   storage_allowed_locations = [
     "s3://${aws_s3_bucket.example.bucket}/"
   ]
-}
-
-# To avoid a Terraform 'Cycle Error', we need to update the AWS role with the correct trusted relationship,
-# using the new snowflake arns we received from the integration
-resource "null_resource" "update_iam_role" {
-  depends_on = [snowflake_storage_integration.s3_integration, aws_iam_role.snowflake_access_role]
-  triggers = {
-    always_run = timestamp()
-  }
-  provisioner "local-exec" {
-    command = <<EOT
-      aws iam update-assume-role-policy --role-name ${aws_iam_role.snowflake_access_role.name} --policy-document '{
-        "Version": "2012-10-17",
-        "Statement": [
-          {
-            "Effect": "Allow",
-            "Principal": {
-              "AWS": "${snowflake_storage_integration.s3_integration.storage_aws_iam_user_arn}"
-            },
-            "Action": "sts:AssumeRole",
-            "Condition": {
-              "StringEquals": {
-                "sts:ExternalId": "${snowflake_storage_integration.s3_integration.storage_aws_external_id}"
-              }
-            }
-          }
-        ]
-      }'
-    EOT
-  }
 }
