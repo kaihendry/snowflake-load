@@ -11,8 +11,7 @@ USE WAREHOUSE "snowflakeap_WH";
 -- ============================================================
 -- Step 1: Create a Parquet file format (temporary, in-worksheet)
 -- ============================================================
-CREATE OR REPLACE FILE FORMAT parquet_fmt
-  TYPE = 'PARQUET';
+CREATE OR REPLACE FILE FORMAT parquet_fmt TYPE = 'PARQUET';
 
 -- ============================================================
 -- Step 2: Verify the stage and see what files are available
@@ -20,27 +19,41 @@ CREATE OR REPLACE FILE FORMAT parquet_fmt
 LIST @"snowflakeap_S3_STAGE";
 
 -- ============================================================
--- Step 3: Query Parquet directly to see the structure
--- Parquet stores data as a single VARIANT column with nested fields
+-- Step 3: Infer schema from Parquet (shows actual column names!)
 -- ============================================================
-SELECT $1 FROM @"snowflakeap_S3_STAGE"/sample_users.parquet
-  (FILE_FORMAT => parquet_fmt)
-LIMIT 1;
+SELECT * FROM TABLE(
+  INFER_SCHEMA(
+    LOCATION => '@"snowflakeap_S3_STAGE"/sample_users.parquet',
+    FILE_FORMAT => 'parquet_fmt'
+  )
+);
 
 -- ============================================================
--- Step 4: Create the table by extracting Parquet fields
--- Parquet preserves actual column names!
+-- Step 4: Create table using inferred schema
+-- No need to manually specify columns - Parquet has them!
 -- ============================================================
-CREATE OR REPLACE TABLE "USERS" AS
-SELECT
-  $1:USER_ID::NUMBER AS USER_ID,
-  $1:FIRST_NAME::VARCHAR AS FIRST_NAME,
-  $1:LAST_NAME::VARCHAR AS LAST_NAME
-FROM @"snowflakeap_S3_STAGE"/sample_users.parquet
-  (FILE_FORMAT => parquet_fmt);
+CREATE OR REPLACE TABLE "USERS"
+USING TEMPLATE (
+  SELECT ARRAY_AGG(OBJECT_CONSTRUCT(*))
+  FROM TABLE(
+    INFER_SCHEMA(
+      LOCATION => '@"snowflakeap_S3_STAGE"/sample_users.parquet',
+      FILE_FORMAT => 'parquet_fmt'
+    )
+  )
+);
 
 -- ============================================================
--- Step 4: Verify the data was loaded successfully
+-- Step 5: Load the data
+-- ============================================================
+COPY INTO "USERS"
+FROM @"snowflakeap_S3_STAGE"
+FILES = ('sample_users.parquet')
+FILE_FORMAT = (FORMAT_NAME = 'parquet_fmt')
+MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE;
+
+-- ============================================================
+-- Step 6: Verify the data was loaded successfully
 -- ============================================================
 
 -- Show table structure
@@ -50,12 +63,4 @@ DESCRIBE TABLE "USERS";
 SELECT COUNT(*) as total_rows FROM "USERS";
 
 -- View all rows (small dataset)
-SELECT * FROM "USERS";
-
--- View with explicit column names (Parquet preserves actual column names!)
-SELECT
-    "USER_ID",
-    "FIRST_NAME",
-    "LAST_NAME"
-FROM "USERS"
-ORDER BY "USER_ID";
+SELECT * FROM "USERS" ORDER BY "USER_ID";
