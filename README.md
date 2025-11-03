@@ -114,11 +114,10 @@ CREATE STAGE TEST_BAD URL = 's3://<alias>/secret/';
 ### Files Available
 | File | Description |
 |------|-------------|
-| `DEPLOYMENT_SUMMARY.md` | Complete deployment details and status |
-| `TESTING_RESULTS.md` | Test cases and verification checklist |
 | `SECURITY.md` | Detailed security architecture |
-| `IMPLEMENTATION_NOTES.md` | Technical implementation details |
-| `verify_access.sql` | Comprehensive access tests |
+| `SIMPLIFICATIONS.md` | Security policy refactoring details |
+| `load_data_worksheet.sql` | Test data loading via Access Point |
+| `test_secret_access.sql` | Verify secret/ directory is blocked |
 
 ## Verified Security
 
