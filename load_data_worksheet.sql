@@ -1,5 +1,5 @@
 -- ============================================================
--- Snowflake Worksheet: Load sample_users.csv from S3
+-- Snowflake Worksheet: Load sample_users.parquet from S3
 -- Copy this entire script into a Snowflake worksheet and run
 -- ============================================================
 
@@ -9,47 +9,38 @@ USE SCHEMA "snowflakeap_SC";
 USE WAREHOUSE "snowflakeap_WH";
 
 -- ============================================================
--- Step 1: Verify the stage and see what files are available
+-- Step 1: Create a Parquet file format (temporary, in-worksheet)
+-- ============================================================
+CREATE OR REPLACE FILE FORMAT parquet_fmt
+  TYPE = 'PARQUET';
+
+-- ============================================================
+-- Step 2: Verify the stage and see what files are available
 -- ============================================================
 LIST @"snowflakeap_S3_STAGE";
 
 -- ============================================================
--- Step 2: Infer the schema from the CSV file
+-- Step 3: Query Parquet directly to see the structure
+-- Parquet stores data as a single VARIANT column with nested fields
 -- ============================================================
-SELECT *
-FROM TABLE(
-  INFER_SCHEMA(
-    LOCATION => '@"snowflakeap_S3_STAGE"/sample_users.csv',
-    FILE_FORMAT => 'TYPE=CSV, SKIP_HEADER=1'
-  )
-);
+SELECT $1 FROM @"snowflakeap_S3_STAGE"/sample_users.parquet
+  (FILE_FORMAT => parquet_fmt)
+LIMIT 1;
 
 -- ============================================================
--- Step 3: Create the table using inferred schema
+-- Step 4: Create the table by extracting Parquet fields
+-- Parquet preserves actual column names!
 -- ============================================================
-CREATE OR REPLACE TABLE "USERS"
-USING TEMPLATE (
-  SELECT ARRAY_AGG(OBJECT_CONSTRUCT(*))
-  FROM TABLE(
-    INFER_SCHEMA(
-      LOCATION => '@"snowflakeap_S3_STAGE"/sample_users.csv',
-      FILE_FORMAT => 'TYPE=CSV, SKIP_HEADER=1'
-    )
-  )
-);
+CREATE OR REPLACE TABLE "USERS" AS
+SELECT
+  $1:USER_ID::NUMBER AS USER_ID,
+  $1:FIRST_NAME::VARCHAR AS FIRST_NAME,
+  $1:LAST_NAME::VARCHAR AS LAST_NAME
+FROM @"snowflakeap_S3_STAGE"/sample_users.parquet
+  (FILE_FORMAT => parquet_fmt);
 
 -- ============================================================
--- Step 4: Load the data from S3 into the table
--- ============================================================
-COPY INTO "USERS"
-FROM @"snowflakeap_S3_STAGE"
-FILES = ('sample_users.csv')
-FILE_FORMAT = (TYPE = 'CSV', SKIP_HEADER = 1)
-ON_ERROR = 'CONTINUE'
-PURGE = FALSE;
-
--- ============================================================
--- Step 5: Verify the data was loaded successfully
+-- Step 4: Verify the data was loaded successfully
 -- ============================================================
 
 -- Show table structure
@@ -61,10 +52,10 @@ SELECT COUNT(*) as total_rows FROM "USERS";
 -- View all rows (small dataset)
 SELECT * FROM "USERS";
 
--- View with explicit column names (inferred schema uses c1, c2, c3)
+-- View with explicit column names (Parquet preserves actual column names!)
 SELECT
-    "c1" as USER_ID,
-    "c2" as FIRST_NAME,
-    "c3" as LAST_NAME
+    "USER_ID",
+    "FIRST_NAME",
+    "LAST_NAME"
 FROM "USERS"
-ORDER BY "c1";
+ORDER BY "USER_ID";
