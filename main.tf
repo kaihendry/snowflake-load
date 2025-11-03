@@ -51,8 +51,8 @@ resource "aws_s3_access_point" "snowflake_access_point" {
   }
 }
 
-# Access Point Policy - Role-level only: deny everyone except Snowflake role
-# Simpler, easier to reason about, hard to misconfigure
+# Access Point Policy - explicit allow for Snowflake role only
+# No wildcards, no conditions, just explicit principal
 resource "aws_s3control_access_point_policy" "snowflake_access_point_policy" {
   access_point_arn = aws_s3_access_point.snowflake_access_point.arn
 
@@ -60,19 +60,25 @@ resource "aws_s3control_access_point_policy" "snowflake_access_point_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "DenyAllExceptSnowflakeRole"
-        Effect = "Deny"
-        Principal = "*"
-        Action = "s3:*"
-        Resource = [
-          aws_s3_access_point.snowflake_access_point.arn,
-          "${aws_s3_access_point.snowflake_access_point.arn}/object/*"
-        ]
-        Condition = {
-          StringNotEquals = {
-            "aws:PrincipalArn" = aws_iam_role.snowflake_access_role.arn
-          }
+        Sid    = "AllowObjectAccess"
+        Effect = "Allow"
+        Principal = {
+          AWS = aws_iam_role.snowflake_access_role.arn
         }
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectVersion"
+        ]
+        Resource = "${aws_s3_access_point.snowflake_access_point.arn}/object/*"
+      },
+      {
+        Sid    = "AllowListAccess"
+        Effect = "Allow"
+        Principal = {
+          AWS = aws_iam_role.snowflake_access_role.arn
+        }
+        Action = "s3:ListBucket"
+        Resource = aws_s3_access_point.snowflake_access_point.arn
       }
     ]
   })
@@ -154,11 +160,6 @@ resource "aws_iam_role_policy" "snowflake_access_policy" {
           "s3:GetBucketLocation"
         ]
         Resource = aws_s3_access_point.snowflake_access_point.arn
-        Condition = {
-          StringLike = {
-            "s3:prefix" = ["202511/*", "202511"]
-          }
-        }
       }
     ]
   })
