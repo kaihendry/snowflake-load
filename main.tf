@@ -51,8 +51,8 @@ resource "aws_s3_access_point" "snowflake_access_point" {
   }
 }
 
-# Access Point Policy - allows access to both Snowflake IAM user and role
-# Restricted to 202511/ prefix only
+# Access Point Policy - Role-level only: deny everyone except Snowflake role
+# Simpler, easier to reason about, hard to misconfigure
 resource "aws_s3control_access_point_policy" "snowflake_access_point_policy" {
   access_point_arn = aws_s3_access_point.snowflake_access_point.arn
 
@@ -60,37 +60,26 @@ resource "aws_s3control_access_point_policy" "snowflake_access_point_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "AllowListBucket"
-        Effect = "Allow"
-        Principal = {
-          AWS = [
-            snowflake_storage_integration.s3_integration.storage_aws_iam_user_arn,
-            aws_iam_role.snowflake_access_role.arn
-          ]
-        }
-        Action = "s3:ListBucket"
-        Resource = aws_s3_access_point.snowflake_access_point.arn
-      },
-      {
-        Sid    = "AllowObjectOperations"
-        Effect = "Allow"
-        Principal = {
-          AWS = [
-            snowflake_storage_integration.s3_integration.storage_aws_iam_user_arn,
-            aws_iam_role.snowflake_access_role.arn
-          ]
-        }
-        Action = [
-          "s3:GetObject",
-          "s3:GetObjectVersion"
+        Sid    = "DenyAllExceptSnowflakeRole"
+        Effect = "Deny"
+        Principal = "*"
+        Action = "s3:*"
+        Resource = [
+          aws_s3_access_point.snowflake_access_point.arn,
+          "${aws_s3_access_point.snowflake_access_point.arn}/object/*"
         ]
-        Resource = "${aws_s3_access_point.snowflake_access_point.arn}/object/202511/*"
+        Condition = {
+          StringNotEquals = {
+            "aws:PrincipalArn" = aws_iam_role.snowflake_access_role.arn
+          }
+        }
       }
     ]
   })
 }
 
-# Bucket policy to delegate access control to the Access Point
+# Bucket policy - delegate access control to Access Point
+# Access through Access Point only, no direct bucket access
 resource "aws_s3_bucket_policy" "delegate_to_access_point" {
   bucket = aws_s3_bucket.example.id
 
@@ -98,11 +87,9 @@ resource "aws_s3_bucket_policy" "delegate_to_access_point" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "DelegateAccessToAccessPoint"
+        Sid    = "DelegateToAccessPoint"
         Effect = "Allow"
-        Principal = {
-          AWS = "*"
-        }
+        Principal = "*"
         Action = "s3:*"
         Resource = [
           aws_s3_bucket.example.arn,
@@ -142,8 +129,8 @@ resource "aws_iam_role" "snowflake_access_role" {
   depends_on = [snowflake_storage_integration.s3_integration]
 }
 
-// add s3 permissions to the role - needs BOTH Access Point AND bucket permissions
-// Snowflake validates stage against the bucket, then uses Access Point for data access
+// IAM role policy - ONLY allows Access Point access (no direct bucket access)
+// This enforces that all S3 operations must go through the Access Point
 resource "aws_iam_role_policy" "snowflake_access_policy" {
   name = "${local.project}-${local.snowflake_iam_role}-policy"
   role = aws_iam_role.snowflake_access_role.id
@@ -151,29 +138,25 @@ resource "aws_iam_role_policy" "snowflake_access_policy" {
     Version = "2012-10-17"
     Statement = [
       {
+        Sid    = "AllowAccessPointObjectAccess"
         Effect = "Allow"
         Action = [
           "s3:GetObject",
           "s3:GetObjectVersion"
         ]
-        Resource = [
-          "${aws_s3_access_point.snowflake_access_point.arn}/object/202511/*",
-          "${aws_s3_bucket.example.arn}/202511/*"
-        ]
+        Resource = "${aws_s3_access_point.snowflake_access_point.arn}/object/202511/*"
       },
       {
+        Sid    = "AllowAccessPointListAccess"
         Effect = "Allow"
         Action = [
           "s3:ListBucket",
           "s3:GetBucketLocation"
         ]
-        Resource = [
-          aws_s3_access_point.snowflake_access_point.arn,
-          aws_s3_bucket.example.arn
-        ]
+        Resource = aws_s3_access_point.snowflake_access_point.arn
         Condition = {
           StringLike = {
-            "s3:prefix" = ["202511/*"]
+            "s3:prefix" = ["202511/*", "202511"]
           }
         }
       }
