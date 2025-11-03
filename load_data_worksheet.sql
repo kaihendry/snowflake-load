@@ -20,7 +20,7 @@ SELECT *
 FROM TABLE(
   INFER_SCHEMA(
     LOCATION => '@"snowflakeap_S3_STAGE"/sample_users.csv',
-    FILE_FORMAT => '"snowflakeap_DB"."snowflakeap_SC"."snowflakeap_CSV_FORMAT"'
+    FILE_FORMAT => 'TYPE=CSV, SKIP_HEADER=1'
   )
 );
 
@@ -33,7 +33,7 @@ USING TEMPLATE (
   FROM TABLE(
     INFER_SCHEMA(
       LOCATION => '@"snowflakeap_S3_STAGE"/sample_users.csv',
-      FILE_FORMAT => '"snowflakeap_DB"."snowflakeap_SC"."snowflakeap_CSV_FORMAT"'
+      FILE_FORMAT => 'TYPE=CSV, SKIP_HEADER=1'
     )
   )
 );
@@ -44,7 +44,7 @@ USING TEMPLATE (
 COPY INTO "USERS"
 FROM @"snowflakeap_S3_STAGE"
 FILES = ('sample_users.csv')
-FILE_FORMAT = (FORMAT_NAME = '"snowflakeap_DB"."snowflakeap_SC"."snowflakeap_CSV_FORMAT"')
+FILE_FORMAT = (TYPE = 'CSV', SKIP_HEADER = 1)
 ON_ERROR = 'CONTINUE'
 PURGE = FALSE;
 
