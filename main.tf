@@ -59,7 +59,6 @@ resource "aws_iam_role" "snowflake_access_role" {
       }
     ]
   })
-
   depends_on = [snowflake_storage_integration.s3_integration]
 }
 
@@ -92,13 +91,13 @@ locals {
 }
 
 provider "snowflake" {
-  organization_name        = local.organization_name
-  account_name             = local.account_name
-  user                     = "TERRAFORM_SVC"
-  role                     = "ACCOUNTADMIN"
-  authenticator            = "SNOWFLAKE_JWT"
-  private_key              = file(local.private_key_path)
-  preview_features_enabled = ["snowflake_storage_integration_resource", "snowflake_stage_resource"]
+  organization_name = local.organization_name
+  account_name      = local.account_name
+  user              = "TERRAFORM_SVC"
+  role              = "ACCOUNTADMIN"
+  authenticator     = "SNOWFLAKE_JWT"
+  private_key       = file(local.private_key_path)
+  preview_features_enabled = ["snowflake_storage_integration_resource", "snowflake_stage_resource", "snowflake_file_format_resource"]
 }
 
 resource "snowflake_database" "tf_db" {
@@ -128,11 +127,38 @@ resource "snowflake_schema" "tf_db_tf_schema" {
 // https://registry.terraform.io/providers/snowflakedb/snowflake/latest/docs/resources/storage_integration
 // Create storage integration first without IAM role ARN
 resource "snowflake_storage_integration" "s3_integration" {
-  name                 = "${local.project}_S3_INTEGRATION"
-  storage_aws_role_arn = local.precalculated_snowflake_role_arn
-  storage_provider     = "S3"
-  enabled              = true
+  name                    = "${local.project}_S3_INTEGRATION"
+  storage_aws_role_arn    = local.precalculated_snowflake_role_arn
+  storage_provider        = "S3"
+  enabled                 = true
+  storage_aws_external_id = "foobar"
   storage_allowed_locations = [
     "s3://${aws_s3_bucket.example.bucket}/"
   ]
+}
+
+# Create CSV file format
+resource "snowflake_file_format" "csv_format" {
+  name                         = "${local.project}_CSV_FORMAT"
+  database                     = snowflake_database.tf_db.name
+  schema                       = snowflake_schema.tf_db_tf_schema.name
+  format_type                  = "CSV"
+  compression                  = "AUTO"
+  field_delimiter              = ","
+  record_delimiter             = "\n"
+  skip_header                  = 1
+  field_optionally_enclosed_by = "\""
+  trim_space                   = true
+  error_on_column_count_mismatch = false
+  null_if                      = ["NULL", "null", ""]
+}
+
+# Create stage pointing to S3
+resource "snowflake_stage" "s3_stage" {
+  name                = "${local.project}_S3_STAGE"
+  database            = snowflake_database.tf_db.name
+  schema              = snowflake_schema.tf_db_tf_schema.name
+  url                 = "s3://${aws_s3_bucket.example.bucket}/202511/"
+  storage_integration = snowflake_storage_integration.s3_integration.name
+  depends_on          = [snowflake_file_format.csv_format, snowflake_schema.tf_db_tf_schema]
 }
