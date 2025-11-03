@@ -38,6 +38,86 @@ resource "aws_s3_bucket" "example" {
   )
 }
 
+# S3 Access Point restricted to 202511/ prefix only
+resource "aws_s3_access_point" "snowflake_access_point" {
+  bucket = aws_s3_bucket.example.id
+  name   = "${local.project}-snowflake-ap"
+
+  public_access_block_configuration {
+    block_public_acls       = true
+    block_public_policy     = true
+    ignore_public_acls      = true
+    restrict_public_buckets = true
+  }
+}
+
+# Access Point Policy - allows access to both Snowflake IAM user and role
+# Restricted to 202511/ prefix only
+resource "aws_s3control_access_point_policy" "snowflake_access_point_policy" {
+  access_point_arn = aws_s3_access_point.snowflake_access_point.arn
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowListBucket"
+        Effect = "Allow"
+        Principal = {
+          AWS = [
+            snowflake_storage_integration.s3_integration.storage_aws_iam_user_arn,
+            aws_iam_role.snowflake_access_role.arn
+          ]
+        }
+        Action = "s3:ListBucket"
+        Resource = aws_s3_access_point.snowflake_access_point.arn
+      },
+      {
+        Sid    = "AllowObjectOperations"
+        Effect = "Allow"
+        Principal = {
+          AWS = [
+            snowflake_storage_integration.s3_integration.storage_aws_iam_user_arn,
+            aws_iam_role.snowflake_access_role.arn
+          ]
+        }
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectVersion"
+        ]
+        Resource = "${aws_s3_access_point.snowflake_access_point.arn}/object/202511/*"
+      }
+    ]
+  })
+}
+
+# Bucket policy to delegate access control to the Access Point
+resource "aws_s3_bucket_policy" "delegate_to_access_point" {
+  bucket = aws_s3_bucket.example.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "DelegateAccessToAccessPoint"
+        Effect = "Allow"
+        Principal = {
+          AWS = "*"
+        }
+        Action = "s3:*"
+        Resource = [
+          aws_s3_bucket.example.arn,
+          "${aws_s3_bucket.example.arn}/*"
+        ]
+        Condition = {
+          StringEquals = {
+            "s3:DataAccessPointAccount" = data.aws_caller_identity.current.account_id
+          }
+        }
+      }
+    ]
+  })
+}
+
 // Create Snowflake IAM role based on the results of storage integration
 resource "aws_iam_role" "snowflake_access_role" {
   name = join("-", [local.project, local.snowflake_iam_role])
@@ -62,7 +142,8 @@ resource "aws_iam_role" "snowflake_access_role" {
   depends_on = [snowflake_storage_integration.s3_integration]
 }
 
-// add s3 permissions to the role
+// add s3 permissions to the role - needs BOTH Access Point AND bucket permissions
+// Snowflake validates stage against the bucket, then uses Access Point for data access
 resource "aws_iam_role_policy" "snowflake_access_policy" {
   name = "${local.project}-${local.snowflake_iam_role}-policy"
   role = aws_iam_role.snowflake_access_role.id
@@ -73,12 +154,28 @@ resource "aws_iam_role_policy" "snowflake_access_policy" {
         Effect = "Allow"
         Action = [
           "s3:GetObject",
-          "s3:ListBucket"
+          "s3:GetObjectVersion"
         ]
         Resource = [
-          aws_s3_bucket.example.arn,
-          "${aws_s3_bucket.example.arn}/*"
+          "${aws_s3_access_point.snowflake_access_point.arn}/object/202511/*",
+          "${aws_s3_bucket.example.arn}/202511/*"
         ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:ListBucket",
+          "s3:GetBucketLocation"
+        ]
+        Resource = [
+          aws_s3_access_point.snowflake_access_point.arn,
+          aws_s3_bucket.example.arn
+        ]
+        Condition = {
+          StringLike = {
+            "s3:prefix" = ["202511/*"]
+          }
+        }
       }
     ]
   })
@@ -91,12 +188,12 @@ locals {
 }
 
 provider "snowflake" {
-  organization_name = local.organization_name
-  account_name      = local.account_name
-  user              = "TERRAFORM_SVC"
-  role              = "ACCOUNTADMIN"
-  authenticator     = "SNOWFLAKE_JWT"
-  private_key       = file(local.private_key_path)
+  organization_name        = local.organization_name
+  account_name             = local.account_name
+  user                     = "TERRAFORM_SVC"
+  role                     = "ACCOUNTADMIN"
+  authenticator            = "SNOWFLAKE_JWT"
+  private_key              = file(local.private_key_path)
   preview_features_enabled = ["snowflake_storage_integration_resource", "snowflake_stage_resource"]
 }
 
@@ -125,7 +222,7 @@ resource "snowflake_schema" "tf_db_tf_schema" {
 }
 
 // https://registry.terraform.io/providers/snowflakedb/snowflake/latest/docs/resources/storage_integration
-// Create storage integration first without IAM role ARN
+// Create storage integration using Access Point ARN
 resource "snowflake_storage_integration" "s3_integration" {
   name                    = "${local.project}_S3_INTEGRATION"
   storage_aws_role_arn    = local.precalculated_snowflake_role_arn
@@ -133,15 +230,37 @@ resource "snowflake_storage_integration" "s3_integration" {
   enabled                 = true
   storage_aws_external_id = "foobar"
   storage_allowed_locations = [
-    "s3://${aws_s3_bucket.example.bucket}/"
+    "s3://${aws_s3_access_point.snowflake_access_point.alias}/202511/"
   ]
 }
 
-# Create stage pointing to S3
-resource "snowflake_stage" "s3_stage" {
-  name                = "${local.project}_S3_STAGE"
-  database            = snowflake_database.tf_db.name
-  schema              = snowflake_schema.tf_db_tf_schema.name
-  url                 = "s3://${aws_s3_bucket.example.bucket}/202511/"
-  storage_integration = snowflake_storage_integration.s3_integration.name
+# Create stage using snowflake_execute since provider doesn't support aws_access_point_arn
+# We need to create the stage directly with CREATE OR REPLACE STAGE SQL
+resource "snowflake_execute" "create_stage_with_access_point" {
+  execute = "CREATE OR REPLACE STAGE \"${snowflake_database.tf_db.name}\".\"${snowflake_schema.tf_db_tf_schema.name}\".\"${local.project}_S3_STAGE\" STORAGE_INTEGRATION = \"${snowflake_storage_integration.s3_integration.name}\" URL = 's3://${aws_s3_access_point.snowflake_access_point.alias}/202511/' AWS_ACCESS_POINT_ARN = '${aws_s3_access_point.snowflake_access_point.arn}' DIRECTORY = (ENABLE = TRUE)"
+
+  revert = "DROP STAGE IF EXISTS \"${snowflake_database.tf_db.name}\".\"${snowflake_schema.tf_db_tf_schema.name}\".\"${local.project}_S3_STAGE\""
+
+  depends_on = [snowflake_storage_integration.s3_integration, snowflake_schema.tf_db_tf_schema]
+}
+
+# Outputs
+output "access_point_arn" {
+  description = "ARN of the S3 Access Point"
+  value       = aws_s3_access_point.snowflake_access_point.arn
+}
+
+output "access_point_alias" {
+  description = "Alias of the S3 Access Point (use this for S3 operations)"
+  value       = aws_s3_access_point.snowflake_access_point.alias
+}
+
+output "bucket_name" {
+  description = "Name of the S3 bucket"
+  value       = aws_s3_bucket.example.bucket
+}
+
+output "snowflake_role_arn" {
+  description = "ARN of the IAM role used by Snowflake"
+  value       = aws_iam_role.snowflake_access_role.arn
 }
