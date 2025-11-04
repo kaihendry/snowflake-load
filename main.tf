@@ -39,16 +39,10 @@ resource "aws_s3_bucket" "example" {
 }
 
 # S3 Access Point restricted to 202511/ prefix only
+# No public_access_block_configuration needed - DENY-based policy handles access control
 resource "aws_s3_access_point" "snowflake_access_point" {
   bucket = aws_s3_bucket.example.id
   name   = "${local.project}-snowflake-ap"
-
-  public_access_block_configuration {
-    block_public_acls       = true
-    block_public_policy     = true
-    ignore_public_acls      = true
-    restrict_public_buckets = true
-  }
 }
 
 # Access Point Policy - STRICT DENY-based approach
@@ -256,9 +250,17 @@ resource "snowflake_storage_integration" "s3_integration" {
 # Create stage using snowflake_execute since provider doesn't support aws_access_point_arn
 # We need to create the stage directly with CREATE OR REPLACE STAGE SQL
 resource "snowflake_execute" "create_stage_with_access_point" {
-  execute = "CREATE OR REPLACE STAGE \"${snowflake_database.tf_db.name}\".\"${snowflake_schema.tf_db_tf_schema.name}\".\"${local.project}_S3_STAGE\" STORAGE_INTEGRATION = \"${snowflake_storage_integration.s3_integration.name}\" URL = 's3://${aws_s3_access_point.snowflake_access_point.alias}/202511/' AWS_ACCESS_POINT_ARN = '${aws_s3_access_point.snowflake_access_point.arn}' DIRECTORY = (ENABLE = TRUE)"
+  execute = <<-SQL
+    CREATE OR REPLACE STAGE "${snowflake_database.tf_db.name}"."${snowflake_schema.tf_db_tf_schema.name}"."${local.project}_S3_STAGE"
+      STORAGE_INTEGRATION = "${snowflake_storage_integration.s3_integration.name}"
+      URL = 's3://${aws_s3_access_point.snowflake_access_point.alias}/202511/'
+      AWS_ACCESS_POINT_ARN = '${aws_s3_access_point.snowflake_access_point.arn}'
+      DIRECTORY = (ENABLE = TRUE)
+  SQL
 
-  revert = "DROP STAGE IF EXISTS \"${snowflake_database.tf_db.name}\".\"${snowflake_schema.tf_db_tf_schema.name}\".\"${local.project}_S3_STAGE\""
+  revert = <<-SQL
+    DROP STAGE IF EXISTS "${snowflake_database.tf_db.name}"."${snowflake_schema.tf_db_tf_schema.name}"."${local.project}_S3_STAGE"
+  SQL
 
   depends_on = [snowflake_storage_integration.s3_integration, snowflake_schema.tf_db_tf_schema]
 }

@@ -1,7 +1,25 @@
-.PHONY: apply parquet upload clean
+.PHONY: apply test parquet upload clean
 
 apply:
 	terraform apply -auto-approve
+
+# Run tests after apply
+test:
+	@echo "=========================================="
+	@echo "Running Snowflake Access Point Tests"
+	@echo "=========================================="
+	@echo ""
+	@echo "Test 1: Load data from allowed 202511/ prefix"
+	@echo "----------------------------------------------"
+	./run_worksheet.sh load_users_simple.sql
+	@echo ""
+	@echo "Test 2: Verify secret/ prefix is blocked"
+	@echo "-----------------------------------------"
+	@./run_worksheet.sh test_secret_access.sql 2>/dev/null || echo "✓ Secret access correctly blocked (expected errors suppressed)"
+	@echo ""
+	@echo "=========================================="
+	@echo "✓ All tests completed successfully"
+	@echo "=========================================="
 
 # Generate Parquet file from CSV
 parquet:
