@@ -51,34 +51,69 @@ resource "aws_s3_access_point" "snowflake_access_point" {
   }
 }
 
-# Access Point Policy - explicit allow for Snowflake role only
-# No wildcards, no conditions, just explicit principal
+# Access Point Policy - STRICT DENY-based approach
+# Uses 3 DENY statements with negative conditions for defense-in-depth
+# All conditions must pass (logical AND) for access to be granted
+# Trade-off: More complex than simple role-level lock (see SECURITY.md)
 resource "aws_s3control_access_point_policy" "snowflake_access_point_policy" {
   access_point_arn = aws_s3_access_point.snowflake_access_point.arn
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
+      # 1. Deny blocked object actions (write and delete not allowed)
       {
-        Sid    = "AllowObjectAccess"
-        Effect = "Allow"
-        Principal = {
-          AWS = aws_iam_role.snowflake_access_role.arn
-        }
+        Sid       = "DenyBlockedObjectActions"
+        Effect    = "Deny"
+        Principal = "*"
         Action = [
-          "s3:GetObject",
-          "s3:GetObjectVersion"
+          "s3:PutObject",
+          "s3:PutObjectTagging",
+          "s3:PutObjectVersionTagging",
+          "s3:DeleteObject",
+          "s3:DeleteObjectTagging",
+          "s3:DeleteObjectVersion",
+          "s3:DeleteObjectVersionTagging"
         ]
         Resource = "${aws_s3_access_point.snowflake_access_point.arn}/object/*"
       },
+      # 2. Deny allowed actions if NOT from the authorized principal
       {
-        Sid    = "AllowListAccess"
-        Effect = "Allow"
-        Principal = {
-          AWS = aws_iam_role.snowflake_access_role.arn
+        Sid       = "DenyAllowedActionsIfNotPrincipal"
+        Effect    = "Deny"
+        Principal = "*"
+        Action = [
+          "s3:ListBucket",
+          "s3:ListBucketVersions",
+          "s3:GetObject",
+          "s3:GetObjectTagging",
+          "s3:GetObjectVersion",
+          "s3:GetObjectVersionTagging"
+        ]
+        Resource = [
+          aws_s3_access_point.snowflake_access_point.arn,
+          "${aws_s3_access_point.snowflake_access_point.arn}/object/*"
+        ]
+        Condition = {
+          StringNotEquals = {
+            "aws:PrincipalArn" = aws_iam_role.snowflake_access_role.arn
+          }
         }
-        Action = "s3:ListBucket"
-        Resource = aws_s3_access_point.snowflake_access_point.arn
+      },
+      # 3. Deny read actions if NOT within the 202511/ prefix
+      {
+        Sid       = "DenyReadIfNotPrefix"
+        Effect    = "Deny"
+        Principal = "*"
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectTagging",
+          "s3:GetObjectVersion",
+          "s3:GetObjectVersionTagging"
+        ]
+        NotResource = [
+          "${aws_s3_access_point.snowflake_access_point.arn}/object/202511/*"
+        ]
       }
     ]
   })
@@ -93,10 +128,10 @@ resource "aws_s3_bucket_policy" "delegate_to_access_point" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "DelegateToAccessPoint"
-        Effect = "Allow"
+        Sid       = "DelegateToAccessPoint"
+        Effect    = "Allow"
         Principal = "*"
-        Action = "s3:*"
+        Action    = "s3:*"
         Resource = [
           aws_s3_bucket.example.arn,
           "${aws_s3_bucket.example.arn}/*"

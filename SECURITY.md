@@ -1,7 +1,205 @@
 # S3 Access Point Security Implementation
 
 ## Overview
-This project uses **S3 Access Points** with a **simplified, explicit security model** to restrict Snowflake's access to only the `202511/` prefix in the S3 bucket. The design prioritizes simplicity, auditability, and defense-in-depth.
+This project uses **S3 Access Points** with a **strict DENY-based security model** to restrict Snowflake's access to only the `202511/` prefix in the S3 bucket. The design uses multiple DENY statements for defense-in-depth at the Access Point level.
+
+**⚠️ Trade-off Warning**: This approach uses 3 DENY statements which adds significant complexity. A simpler alternative exists (see "Trade-offs" section below).
+
+---
+
+## Access Point Policy: ALLOW vs DENY-based Approach
+
+### Summary of Changes
+
+Changed from an **explicit ALLOW-based policy** to a **strict DENY-based policy** with three DENY statements.
+
+### Old Approach: ALLOW-based Policy
+
+```json
+{
+  "Statement": [
+    {
+      "Sid": "AllowObjectAccess",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::xxx:role/snowflake-role"},
+      "Action": ["s3:GetObject", "s3:GetObjectVersion"],
+      "Resource": "arn:aws:s3:region:account:accesspoint/ap-name/object/*"
+    },
+    {
+      "Sid": "AllowListAccess",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::xxx:role/snowflake-role"},
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:region:account:accesspoint/ap-name"
+    }
+  ]
+}
+```
+
+**Problems with ALLOW-based:**
+- **Additive security**: Other policies can grant additional permissions
+- **Single layer**: If this policy is bypassed, there's no fallback
+- **Easier to accidentally over-grant**: Missing conditions = broader access
+- **Prefix restrictions only in IAM role**: Not enforced at the Access Point level
+
+### New Approach: DENY-based Policy
+
+```json
+{
+  "Statement": [
+    {
+      "Sid": "DenyBlockedObjectActions",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["s3:PutObject", "s3:DeleteObject", ...],
+      "Resource": "arn:aws:s3:region:account:accesspoint/ap-name/object/*"
+    },
+    {
+      "Sid": "DenyAllowedActionsIfNotPrincipal",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["s3:GetObject", "s3:ListBucket", ...],
+      "Resource": [...],
+      "Condition": {
+        "StringNotEquals": {"aws:PrincipalArn": "arn:aws:iam::xxx:role/snowflake-role"}
+      }
+    },
+    {
+      "Sid": "DenyReadIfNotPrefix",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["s3:GetObject", ...],
+      "NotResource": ["arn:aws:s3:region:account:accesspoint/ap-name/object/202511/*"]
+    }
+  ]
+}
+```
+
+**Benefits of DENY-based:**
+
+1. **Defense in Depth**
+   - Multiple DENY statements that ALL must pass (logical AND)
+   - If any condition fails, access is denied
+   - Cannot be overridden by other ALLOW policies
+
+2. **Explicit Blocklist**
+   - `DenyBlockedObjectActions`: Explicitly denies write/delete operations
+   - Acts as a safety net preventing ANY write or delete through the AP
+
+3. **Negative Conditions (More Restrictive)**
+   - `StringNotEquals`: "Deny if NOT this principal" is stronger than "Allow if this principal"
+   - Forces ALL other principals to be explicitly denied
+   - No room for ambiguity or accidental grants
+
+4. **NotResource Pattern**
+   - `DenyReadIfNotPrefix`: "Deny read if NOT in 202511/ prefix"
+   - Enforces prefix restriction at the Access Point level (not just IAM)
+   - More restrictive than positive Resource matching
+
+5. **Principle of Least Privilege**
+   - Default state is DENY
+   - Access is only granted if you satisfy ALL negative conditions
+   - Harder to accidentally bypass
+
+### AWS Policy Evaluation Order
+
+AWS evaluates policies in this order:
+1. **Explicit DENY** (highest priority - cannot be overridden)
+2. **Explicit ALLOW**
+3. **Implicit DENY** (default)
+
+The DENY-based approach leverages #1 to create an unbreakable security boundary.
+
+### Example Scenario Comparison
+
+**With ALLOW-based policy:**
+- IAM role has `s3:GetObject` on bucket (via bucket policy)
+- Access Point policy allows `s3:GetObject` for role
+- ✅ Access granted
+- ⚠️ If another policy grants broader permissions, they stack
+
+**With DENY-based policy:**
+- Three layers of DENY must be passed:
+  1. ❌ Is this a blocked action? → No (read is allowed)
+  2. ❌ Is this NOT the authorized principal? → No (it is the authorized principal)
+  3. ❌ Is this NOT in the 202511/ prefix? → No (it is in 202511/)
+- ✅ All DENY conditions passed, access granted via IAM role policy
+- 🔒 Even if another policy grants broader permissions, the DENYs override them
+
+### Key Differences Table
+
+| Aspect | ALLOW-based | DENY-based |
+|--------|-------------|------------|
+| **Default state** | Implicit deny | Explicit deny |
+| **Security model** | Permissive | Restrictive |
+| **Policy stacking** | Additive (can expand) | Subtractive (cannot override) |
+| **Prefix enforcement** | IAM only | Access Point + IAM |
+| **Bypass risk** | Higher | Lower |
+| **Complexity** | Simple | More complex |
+| **Best practice** | ❌ Not recommended | ✅ Recommended |
+
+### Trade-offs: 3 DENY Statements vs Simple Role-Level Lock
+
+The current implementation uses **3 DENY statements** for maximum defense-in-depth. However, there's a **simpler alternative** that may be more practical.
+
+#### Current Approach (3 DENY Statements)
+✅ **Pros:**
+- Explicit blocklist of write/delete actions at Access Point level
+- Prefix restriction enforced at Access Point (not just IAM)
+- Multiple layers that ALL must pass (logical AND)
+
+❌ **Cons:**
+- **Stupidly complex** - Hard to understand and audit
+- **Easy to misconfigure** - More statements = more ways to break it
+- **Duplicates IAM logic** - Prefix restrictions already in IAM policy
+- **Maintenance burden** - Changes require updating multiple statements
+
+#### Simpler Alternative: Single Role-Level Lock ([see blog](https://dabase.com/blog/2025/s3-access-points/#role-level-only-policy))
+
+```json
+{
+  "Statement": [
+    {
+      "Sid": "LockAccessPointToOneRole",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:REGION:ACCOUNT:accesspoint/AP_NAME",
+        "arn:aws:s3:REGION:ACCOUNT:accesspoint/AP_NAME/object/*"
+      ],
+      "Condition": {
+        "StringNotEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::ACCOUNT:role/ROLE_NAME"
+        }
+      }
+    }
+  ]
+}
+```
+
+✅ **Pros:**
+- **Tiny, easy to reason about** - One statement, clear intent
+- **Hard to misconfigure** - Minimal surface area for errors
+- **Delegates to IAM** - Let IAM identity policies do the heavy lifting
+- **Universal blocking** - No cross-account backdoors, no anonymous access
+
+❌ **Cons:**
+- No prefix enforcement at Access Point level (relies on IAM)
+- No explicit write/delete blocklist at Access Point level (relies on IAM)
+
+#### Recommendation
+
+**For most use cases**: Use the **simple role-level lock**. It's easier to maintain, harder to misconfigure, and leverages IAM's strengths.
+
+**Use 3 DENY statements only if**:
+- You need defense-in-depth at the Access Point layer itself
+- You don't trust IAM policy governance to remain strict
+- You need prefix restrictions that cannot be bypassed by future IAM changes
+
+This project uses the 3 DENY approach as an **example** of the complex pattern, but the simple approach is often better.
+
+---
 
 ## Architecture
 
@@ -46,26 +244,40 @@ Action   = ["s3:ListBucket", "s3:GetBucketLocation"]
 - ✅ No conditions needed (simplicity)
 - ✅ No direct bucket access possible
 
-### Layer 3: Access Point Policy
-**Purpose**: Explicit allow for specific IAM role only
+### Layer 3: Access Point Policy (DENY-based)
+**Purpose**: Strict DENY-based policy with defense-in-depth (3 DENY statements)
 
 ```hcl
-# Statement 1: Object Access
-Principal = { AWS = "arn:aws:iam::ACCOUNT:role/snowflakeap-role" }
-Action    = ["s3:GetObject", "s3:GetObjectVersion"]
+# Statement 1: Deny blocked object actions (write and delete not allowed)
+Effect    = "Deny"
+Principal = "*"
+Action    = ["s3:PutObject", "s3:DeleteObject", ...]
 Resource  = "${access_point_arn}/object/*"
 
-# Statement 2: List Access
-Principal = { AWS = "arn:aws:iam::ACCOUNT:role/snowflakeap-role" }
-Action    = "s3:ListBucket"
-Resource  = access_point_arn
+# Statement 2: Deny allowed actions if NOT from authorized principal
+Effect    = "Deny"
+Principal = "*"
+Action    = ["s3:ListBucket", "s3:GetObject", ...]
+Resource  = [access_point_arn, "${access_point_arn}/object/*"]
+Condition = {
+  StringNotEquals = {
+    "aws:PrincipalArn" = "arn:aws:iam::ACCOUNT:role/snowflakeap-role"
+  }
+}
+
+# Statement 3: Deny read actions if NOT within 202511/ prefix
+Effect      = "Deny"
+Principal   = "*"
+Action      = ["s3:GetObject", "s3:GetObjectVersion", ...]
+NotResource = ["${access_point_arn}/object/202511/*"]
 ```
 
 **Design principles:**
-- ✅ **Explicit principal** - No `Principal: "*"` with conditions
-- ✅ **No wildcards** - Direct ARN specification
-- ✅ **Easy to audit** - Clear who has access
-- ✅ **Hard to misconfigure** - Simple Allow statements
+- ✅ **Multiple DENY layers** - All must pass (logical AND)
+- ✅ **Negative conditions** - StringNotEquals is more restrictive
+- ✅ **NotResource pattern** - Enforces prefix at Access Point level
+- ✅ **Cannot be overridden** - DENY takes highest precedence
+- ✅ **Defense-in-depth** - Three independent security checks
 
 ### Layer 4: Bucket Policy
 **Purpose**: Delegate all access control to Access Point
@@ -136,13 +348,18 @@ CREATE STAGE TEST_BAD
 Four independent security layers must all allow access:
 1. Storage Integration path restriction
 2. IAM role Access Point-only permissions
-3. Access Point explicit principal allow
+3. Access Point DENY-based policy (3 DENY statements that ALL must pass)
 4. Bucket policy Access Point delegation
 
-### 3. Explicit Principals (No Wildcards)
-- Access Point policy uses explicit IAM role ARN
-- No `Principal: "*"` with StringNotEquals conditions
-- Simpler, easier to audit
+The Access Point DENY-based policy adds additional sub-layers:
+- Layer 3a: Deny blocked actions (write/delete)
+- Layer 3b: Deny if NOT authorized principal
+- Layer 3c: Deny if NOT within 202511/ prefix
+
+### 3. DENY-based Policy with Negative Conditions
+- Access Point policy uses `Principal: "*"` with `StringNotEquals` conditions
+- Multiple DENY statements that ALL must pass (logical AND)
+- Cannot be overridden by other ALLOW policies
 
 ### 4. Path-Based Restriction
 - IAM policy Resource includes `/202511/*` path
@@ -158,15 +375,19 @@ Four independent security layers must all allow access:
 
 ### What We DON'T Do:
 - ❌ Grant both bucket and Access Point permissions (IAM role)
-- ❌ Use `Principal: "*"` with `StringNotEquals` conditions (Access Point)
-- ❌ Rely solely on prefix conditions
-- ❌ Use overly complex nested conditions
+- ❌ Use simple ALLOW-based Access Point policies
+- ❌ Rely solely on IAM-level prefix conditions
+- ❌ Use single-layer security
 
 ### What We DO:
 - ✅ Access Point-only IAM permissions
-- ✅ Explicit principal ARNs (no wildcards)
-- ✅ Path restrictions in Resource strings
-- ✅ Simple, auditable policies
+- ✅ DENY-based Access Point policies (3 DENY statements)
+- ✅ Multiple layers of DENY that ALL must pass
+- ✅ Prefix restrictions at Access Point level (NotResource pattern)
+- ✅ Negative conditions (StringNotEquals) for stronger security
+- ✅ Unbreakable security boundaries (DENY cannot be overridden)
+
+**Note**: While this demonstrates the complex 3-DENY approach, the [simple role-level lock](https://dabase.com/blog/2025/s3-access-points/#role-level-only-policy) is often more practical.
 
 ## Outputs
 
@@ -185,7 +406,8 @@ snowflake_role_arn   = "arn:aws:iam::ACCOUNT:role/snowflakeap-role"
 - [ ] `./run_worksheet.sh test_secret_access.sql` blocks secret/ access
 - [ ] Snowflake stage lists files: `LIST @snowflakeap_S3_STAGE`
 - [ ] IAM policy has no direct bucket ARNs
-- [ ] Access Point policy uses explicit principal (no wildcards)
+- [ ] Access Point policy uses DENY-based approach (3 DENY statements)
+- [ ] Access Point policy uses `StringNotEquals` and `NotResource` patterns
 - [ ] Bucket policy delegates to Access Point
 
 ## References
